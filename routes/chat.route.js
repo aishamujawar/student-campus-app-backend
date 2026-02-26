@@ -1,4 +1,5 @@
 import express from 'express';
+import { body, validationResult } from 'express-validator';
 
 const router = express.Router();
 const DEBUG = process.env.NODE_ENV !== 'production';
@@ -22,26 +23,131 @@ function paragraph(lines) {
   return lines.filter(Boolean).join(' ');
 }
 
-// Probabilistic name usage (35% chance)
+// Probabilistic name usage (35% chance for responses, 50% for greetings)
 function addressMaybe(text, userName) {
-  const useName = Math.random() < 0.35; // 35% chance
+  const useName = Math.random() < 0.35;
   if (!useName || !userName) return text;
   return `${userName}, ${text}`;
 }
 
-// Helper to filter only future dates
+// Enhanced date filtering with validation
 function getFutureDates(items) {
   const today = new Date();
   today.setHours(0, 0, 0, 0);
 
-  return items.filter(item => {
-    const d = new Date(item.date);
-    return d >= today;
-  }).sort((a, b) => new Date(a.date) - new Date(b.date));
+  return items
+    .filter(item => {
+      if (!item?.date) return false;
+      const d = new Date(item.date);
+      if (isNaN(d.getTime())) return false;
+      return d >= today;
+    })
+    .sort((a, b) => new Date(a.date) - new Date(b.date));
 }
 
-router.post('/chat', async (req, res) => {
+// Input validation middleware
+const validateChat = [
+  body('message')
+    .exists().withMessage('Message is required')
+    .isString().withMessage('Message must be text')
+    .trim()
+    .isLength({ min: 1, max: 500 }).withMessage('Message must be 1–500 characters')
+    .customSanitizer(value => 
+      typeof value === 'string' ? value.replace(/[<>]/g, '') : value
+    ), // Remove angle brackets for basic XSS protection with type guard
+  
+  body('user.firstName')
+    .optional()
+    .isString().withMessage('First name must be text')
+    .trim()
+    .isLength({ max: 50 }).withMessage('First name too long'),
+  
+  body('assignments')
+    .optional()
+    .isObject().withMessage('Assignments must be an object'),
+  
+  body('timetable')
+    .optional()
+    .isObject().withMessage('Timetable must be an object'),
+  
+  body('todayIndex')
+    .optional()
+    .isInt({ min: 0, max: 6 }).withMessage('Today index must be between 0-6'),
+  
+  body('cgpa')
+    .optional()
+    .isArray().withMessage('CGPA must be an array'),
+  
+  body('calendarMarks')
+    .optional()
+    .isArray().withMessage('Calendar marks must be an array'),
+  
+  body('attendance')
+    .optional()
+    .isObject().withMessage('Attendance must be an object'),
+  
+  body('attendance.totalHeld')
+    .optional()
+    .isInt({ min: 0 }).withMessage('Total held must be a positive number'),
+  
+  body('attendance.totalAttended')
+    .optional()
+    .isInt({ min: 0 }).withMessage('Total attended must be a positive number'),
+  
+  body('attendance.percentage')
+    .optional()
+    .isFloat({ min: 0, max: 100 }).withMessage('Percentage must be between 0-100'),
+  
+  body('expenses')
+    .optional()
+    .isObject().withMessage('Expenses must be an object'),
+  
+  body('expenses.thisMonth')
+    .optional()
+    .isFloat({ min: 0 }).withMessage('Monthly expense must be a positive number'),
+  
+  body('expenses.total')
+    .optional()
+    .isFloat({ min: 0 }).withMessage('Total expense must be a positive number')
+];
+
+router.post('/chat', validateChat, async (req, res) => {
   try {
+    // Defense in depth: Check for validation errors
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) {
+      // SECURITY LOGGING: Log validation failures
+      console.warn('[SECURITY] Validation failed:', {
+        ip: req.ip,
+        path: req.originalUrl,
+        errors: errors.array(),
+        timestamp: new Date().toISOString()
+      });
+      
+      return res.status(400).json({
+        intent: 'VALIDATION_ERROR',
+        reply: 'I received some invalid information. Please check your request format.',
+        errors: DEBUG ? errors.array() : undefined
+      });
+    }
+
+    // Extra defense: Type check message again (defense in depth)
+    if (typeof req.body.message !== 'string') {
+      // SECURITY LOGGING: Log type mismatch
+      console.warn('[SECURITY] Type validation failed:', {
+        ip: req.ip,
+        path: req.originalUrl,
+        expected: 'string',
+        received: typeof req.body.message,
+        timestamp: new Date().toISOString()
+      });
+      
+      return res.status(400).json({
+        intent: 'VALIDATION_ERROR',
+        reply: 'Invalid message format.'
+      });
+    }
+
     const { 
       message, 
       user = { firstName: 'there' },
@@ -54,37 +160,50 @@ router.post('/chat', async (req, res) => {
       expenses = {}
     } = req.body;
 
-    if (!message || typeof message !== 'string') {
-      return res.status(400).json({ 
-        error: 'Message is required',
-        intent: 'ERROR'
-      });
+    // Message sanitization - validator already trimmed once
+    let sanitizedMessage = message;
+    
+    // Basic XSS prevention - remove script tags and dangerous content
+    sanitizedMessage = sanitizedMessage.replace(/<script\b[^<]*(?:(?!<\/script>)<[^<]*)*<\/script>/gi, '');
+    sanitizedMessage = sanitizedMessage.replace(/javascript:/gi, '');
+    // Safer attribute removal with leading space check
+    sanitizedMessage = sanitizedMessage.replace(/\son\w+=/gi, '');
+    
+    // Limit message length again as safety
+    if (sanitizedMessage.length > 500) {
+      sanitizedMessage = sanitizedMessage.substring(0, 500);
     }
 
     // Get user name
     const userName = user.firstName || 'there';
 
+    // Defensive conversion for lowerMessage
+    const lowerMessage = String(sanitizedMessage).toLowerCase();
+
     // Development logging only
     if (DEBUG) {
       console.log('[Assistant] Received query:', {
         userName,
-        message: message.substring(0, 50),
+        message: sanitizedMessage.substring(0, 50),
         expensesThisMonth: expenses.thisMonth || 0,
         calendarMarksCount: calendarMarks.length,
         hasSubjectsAttendance: attendance.subjects ? Object.keys(attendance.subjects).length : 0
       });
     }
 
-    const lowerMessage = message.toLowerCase();
     let reply = '';
     let intent = 'GENERAL_QUERY';
     
+    // Single now reference for all date calculations
+    const now = new Date();
+    
     // Calculate day index (Monday=0)
-    const jsTodayIndex = new Date().getDay();
+    const jsTodayIndex = now.getDay();
     const normalizedTodayIndex = jsTodayIndex === 0 ? 6 : jsTodayIndex - 1;
     
-    // Calculate assignment count once
-    const assignmentCount = Object.values(assignments).reduce((sum, count) => sum + count, 0);
+    // Calculate assignment count safely (handle non-numbers)
+    const assignmentCount = Object.values(assignments)
+      .reduce((sum, count) => sum + (Number(count) || 0), 0);
     
     // Normalize class times
     const normalizeClassTime = (cls) => {
@@ -318,7 +437,8 @@ router.post('/chat', async (req, res) => {
           
           if (lowestSubject && lowestPercent < 75) {
             const data = subjects[lowestSubject];
-            const needed = Math.ceil(data.held * 0.75) - data.attended;
+            // Prevent negative needed values
+            const needed = Math.max(0, Math.ceil(data.held * 0.75) - data.attended);
             reply = addressMaybe(
               `Your lowest attendance is in ${lowestSubject} at ${lowestPercent}% (${data.attended}/${data.held}). You need to attend ${needed} more classes to reach 75%.`,
               userName
@@ -341,7 +461,7 @@ router.post('/chat', async (req, res) => {
 
         if (percentage < 75) {
           parts.push("This is below the 75% threshold — something to be mindful of.");
-          const needed = Math.ceil(held * 0.75) - attended;
+          const needed = Math.max(0, Math.ceil(held * 0.75) - attended);
           if (needed > 0) {
             parts.push(`You'd need to attend ${needed} more classes to reach 75%.`);
           }
@@ -370,10 +490,10 @@ router.post('/chat', async (req, res) => {
       lowerMessage.includes('marks') ||
       lowerMessage.includes('performance') ||
       lowerMessage.includes('result') ||
-      lowerMessage.includes('academic') ||        // ADDED
-      lowerMessage.includes('progress') ||        // ADDED
-      lowerMessage.includes('improvement') ||     // ADDED
-      lowerMessage.includes('trend')              // ADDED
+      lowerMessage.includes('academic') ||
+      lowerMessage.includes('progress') ||
+      lowerMessage.includes('improvement') ||
+      lowerMessage.includes('trend')
     ) {
       intent = 'ACADEMIC_INSIGHTS';
       
@@ -506,7 +626,6 @@ router.post('/chat', async (req, res) => {
 
       const assignmentDates = Object.keys(assignments);
       const sortedDates = assignmentDates.sort();
-      const now = new Date();
       
       if (lowerMessage.includes('week') || lowerMessage.includes('this week')) {
         const weekAssignments = sortedDates.filter(date => {
@@ -580,7 +699,7 @@ router.post('/chat', async (req, res) => {
         } else {
           const nextHoliday = holidays[0];
           const daysUntil = Math.ceil(
-            (new Date(nextHoliday.date) - new Date()) / (1000 * 60 * 60 * 24)
+            (new Date(nextHoliday.date) - now) / (1000 * 60 * 60 * 24)
           );
 
           reply = addressMaybe(
@@ -601,7 +720,7 @@ router.post('/chat', async (req, res) => {
         } else {
           const nextExam = exams[0];
           const daysUntil = Math.ceil(
-            (new Date(nextExam.date) - new Date()) / (1000 * 60 * 60 * 24)
+            (new Date(nextExam.date) - now) / (1000 * 60 * 60 * 24)
           );
 
           reply = addressMaybe(
@@ -617,7 +736,7 @@ router.post('/chat', async (req, res) => {
         } else {
           const nextDate = futureDates[0];
           const daysUntil = Math.ceil(
-            (new Date(nextDate.date) - new Date()) / (1000 * 60 * 60 * 24)
+            (new Date(nextDate.date) - now) / (1000 * 60 * 60 * 24)
           );
           
           reply = addressMaybe(
@@ -638,7 +757,7 @@ router.post('/chat', async (req, res) => {
 
           futureDates.forEach((d, i) => {
             const daysUntil = Math.ceil(
-              (new Date(d.date) - new Date()) / (1000 * 60 * 60 * 24)
+              (new Date(d.date) - now) / (1000 * 60 * 60 * 24)
             );
             lines.push(`  ${i+1}. ${d.date} — ${d.categoryName} (in ${daysUntil} days)`);
           });
@@ -889,24 +1008,29 @@ router.post('/chat', async (req, res) => {
       }
     }
 
-    // 👋 GREETINGS
+    // 👋 GREETINGS - WITH PROBABILISTIC NAME USAGE
     else if (
       lowerMessage.includes('hi') || 
       lowerMessage.includes('hello') || 
       lowerMessage.includes('hey') ||
-      message.trim() === ''
+      sanitizedMessage.trim() === ''
     ) {
       intent = 'GREETING';
       const todayClasses = getClassesForDay(normalizedTodayIndex);
       
-      const timeOfDay = new Date().getHours();
+      const timeOfDay = now.getHours();
       let greeting = 'Hello';
       if (timeOfDay < 12) greeting = 'Good morning';
       else if (timeOfDay < 17) greeting = 'Good afternoon';
       else greeting = 'Good evening';
       
+      // Probabilistic name usage for greetings (50% chance)
+      const greetingLine = Math.random() < 0.5
+        ? `${greeting}, ${userName}.`
+        : `${greeting}.`;
+      
       const parts = [
-        `${greeting}, ${userName}.`,
+        greetingLine,
         todayClasses.length > 0
           ? `You have ${todayClasses.length} class${todayClasses.length > 1 ? 'es' : ''} today.`
           : "You're free today — no classes scheduled.",
@@ -958,7 +1082,7 @@ router.post('/chat', async (req, res) => {
       intent,
       reply,
       metadata: {
-        timestamp: new Date().toISOString(),
+        timestamp: now.toISOString(),
         userName,
         dataUsed: {
           hasExpenses: !!expenses && Object.keys(expenses).length > 0,
@@ -972,7 +1096,7 @@ router.post('/chat', async (req, res) => {
     });
 
   } catch (error) {
-    console.error('[Assistant] Error:', error);
+    console.error('[Assistant] Error:', error?.message || error);
     return res.status(500).json({ 
       intent: 'ERROR',
       reply: "Something went wrong. Could you try that again?",
