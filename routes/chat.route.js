@@ -17,14 +17,27 @@ function formatReply(lines) {
   return lines.filter(Boolean).join('\n');
 }
 
-// NEW: Paragraph builder for natural flow
+// Paragraph builder for natural flow
 function paragraph(lines) {
   return lines.filter(Boolean).join(' ');
 }
 
-// NEW: User addressing helper
-function addressUser(text, userName) {
+// Probabilistic name usage (35% chance)
+function addressMaybe(text, userName) {
+  const useName = Math.random() < 0.35; // 35% chance
+  if (!useName || !userName) return text;
   return `${userName}, ${text}`;
+}
+
+// Helper to filter only future dates
+function getFutureDates(items) {
+  const today = new Date();
+  today.setHours(0, 0, 0, 0);
+
+  return items.filter(item => {
+    const d = new Date(item.date);
+    return d >= today;
+  }).sort((a, b) => new Date(a.date) - new Date(b.date));
 }
 
 router.post('/chat', async (req, res) => {
@@ -48,7 +61,7 @@ router.post('/chat', async (req, res) => {
       });
     }
 
-    // NEW: Get user name
+    // Get user name
     const userName = user.firstName || 'there';
 
     // Development logging only
@@ -56,7 +69,9 @@ router.post('/chat', async (req, res) => {
       console.log('[Assistant] Received query:', {
         userName,
         message: message.substring(0, 50),
-        expensesThisMonth: expenses.thisMonth || 0
+        expensesThisMonth: expenses.thisMonth || 0,
+        calendarMarksCount: calendarMarks.length,
+        hasSubjectsAttendance: attendance.subjects ? Object.keys(attendance.subjects).length : 0
       });
     }
 
@@ -121,22 +136,46 @@ router.post('/chat', async (req, res) => {
       return analysis;
     };
 
-    // 🎯 HIGHEST PRIORITY: MONTHLY EXPENSE QUERY
+    // 👤 NAME QUERY
     if (
+      lowerMessage.includes('what is my name') ||
+      lowerMessage.includes('who am i') ||
+      lowerMessage.includes('do you know my name') ||
+      lowerMessage.includes('what\'s my name') ||
+      lowerMessage.includes('whats my name')
+    ) {
+      intent = 'NAME_QUERY';
+      reply = `Your name is ${userName}. How can I help you today?`;
+    }
+
+    // 🎯 MONTHLY EXPENSE QUERY
+    else if (
       lowerMessage.includes('this month') &&
       (lowerMessage.includes('spend') || lowerMessage.includes('expense'))
     ) {
       intent = 'EXPENSE_MONTHLY';
 
       if (!expenses || typeof expenses.thisMonth !== 'number') {
-        reply = addressUser("No expense data available for this month.", userName);
+        reply = addressMaybe("I don't have any expense records for this month yet.", userName);
       } else {
-        reply = paragraph([
-          addressUser(`you've spent ₹${expenses.thisMonth.toFixed(2)} so far this month.`, userName),
-          expenses.thisMonth > 10000
-            ? "Spending is on the higher side, so keeping an eye on discretionary expenses would help."
-            : "Your spending looks reasonably controlled at the moment."
-        ]);
+        const spending = expenses.thisMonth.toFixed(2);
+        
+        if (expenses.thisMonth > 10000) {
+          reply = paragraph([
+            `You've spent ₹${spending} this month, which is on the higher side.`,
+            "Might be worth reviewing where the money's going — especially discretionary spending."
+          ]);
+        } else if (expenses.thisMonth > 5000) {
+          reply = paragraph([
+            `So far this month, you've spent ₹${spending}.`,
+            "That's within a moderate range — nothing alarming."
+          ]);
+        } else {
+          reply = paragraph([
+            `Your spending this month is at ₹${spending}.`,
+            "Looks like you're keeping things under control."
+          ]);
+        }
       }
     }
 
@@ -154,45 +193,43 @@ router.post('/chat', async (req, res) => {
       intent = 'EXPENSE_INSIGHTS';
 
       if (!expenses || Object.keys(expenses).length === 0) {
-        reply = addressUser("No expense records found. Start tracking expenses to manage your budget.", userName);
+        reply = addressMaybe("I don't have any expense records yet. Start tracking your spending and I can help you manage your budget.", userName);
       } else {
         const total = expenses.total || 0;
         const thisMonth = expenses.thisMonth || 0;
         const categories = expenses.categories || {};
 
-        const replyLines = [
-          addressUser(`overall spending is ₹${total.toFixed(2)}, with ₹${thisMonth.toFixed(2)} this month.`, userName)
+        const parts = [
+          `Overall, you've spent ₹${total.toFixed(2)} across all time, with ₹${thisMonth.toFixed(2)} so far this month.`
         ];
 
-        // Budget insights
         if (thisMonth > 10000) {
-          replyLines.push("This month's spending is above average. Consider reviewing discretionary expenses.");
+          parts.push("This month's spending is a bit elevated — worth keeping an eye on.");
         } else if (thisMonth > 5000) {
-          replyLines.push("Monthly spending is within moderate range.");
+          parts.push("Monthly spending is within a reasonable range.");
         } else if (thisMonth > 0) {
-          replyLines.push("Your current spending pace is manageable.");
+          parts.push("You're spending at a comfortable pace right now.");
         }
 
-        // Show top categories if available
         if (Object.keys(categories).length > 0) {
           const sortedCategories = Object.entries(categories)
             .sort((a, b) => b[1] - a[1])
             .slice(0, 2);
 
           if (sortedCategories.length > 0) {
-            replyLines.push("Primary spending categories:");
+            parts.push("Your main spending areas:");
             sortedCategories.forEach(([cat, amt]) => {
               const percentage = total > 0 ? ((amt / total) * 100).toFixed(1) : 0;
-              replyLines.push(`• ${cat}: ₹${amt.toFixed(2)} (${percentage}%)`);
+              parts.push(`• ${cat}: ₹${amt.toFixed(2)} (${percentage}% of total)`);
             });
           }
         }
 
-        reply = formatReply(replyLines);
+        reply = addressMaybe(parts.join(' '), userName);
       }
     }
 
-    // 📊 ATTENDANCE INSIGHTS
+    // 📊 ATTENDANCE INSIGHTS - UPDATED WITH PER-SUBJECT
     else if (
       lowerMessage.includes('attendance') ||
       lowerMessage.includes('present') ||
@@ -202,33 +239,128 @@ router.post('/chat', async (req, res) => {
       intent = 'ATTENDANCE_INSIGHTS';
 
       if (!attendance || attendance.totalHeld === 0) {
-        reply = addressUser("No attendance records available yet.", userName);
-      } else {
-        const percentage = attendance.percentage;
-        const attended = attendance.totalAttended;
-        const held = attendance.totalHeld;
+        reply = addressMaybe("No attendance records yet. Once classes start, I can help you track it.", userName);
+        return res.json({ intent, reply });
+      }
 
-        const replyLines = [
-          addressUser(`your attendance is currently at ${percentage}% (${attended} of ${held} classes).`, userName)
+      const percentage = attendance.percentage;
+      const attended = attendance.totalAttended;
+      const held = attendance.totalHeld;
+
+      // Check if asking for per-subject attendance
+      if (
+        lowerMessage.includes('per subject') ||
+        lowerMessage.includes('by subject') ||
+        lowerMessage.includes('each subject') ||
+        lowerMessage.includes('subject wise') ||
+        lowerMessage.includes('subject-wise') ||
+        lowerMessage.includes('subject breakdown') ||
+        lowerMessage.includes('breakdown by subject')
+      ) {
+        // PER-SUBJECT ATTENDANCE RESPONSE
+        const subjects = attendance.subjects || {};
+        const subjectEntries = Object.entries(subjects);
+        
+        if (subjectEntries.length === 0) {
+          reply = addressMaybe("No subject-wise attendance data available.", userName);
+        } else {
+          const lines = ["Here's your attendance by subject:"];
+          
+          // Sort by percentage (lowest first) to highlight concerning subjects
+          const sortedSubjects = subjectEntries.sort((a, b) => {
+            const percentA = a[1].percentage || 0;
+            const percentB = b[1].percentage || 0;
+            return percentA - percentB;
+          });
+          
+          sortedSubjects.forEach(([subjectName, data]) => {
+            const subPercent = data.percentage || 0;
+            const subAttended = data.attended || 0;
+            const subHeld = data.held || 0;
+            
+            let indicator = '';
+            if (subPercent < 75) indicator = '⚠️';
+            else if (subPercent >= 85) indicator = '✓';
+            
+            lines.push(`${indicator} ${subjectName}: ${subPercent}% (${subAttended}/${subHeld})`);
+          });
+          
+          // Add summary
+          lines.push(`\nOverall: ${percentage}% (${attended}/${held})`);
+          
+          reply = formatReply(lines);
+        }
+      } 
+      else if (
+        lowerMessage.includes('which subject') ||
+        lowerMessage.includes('what subject') ||
+        /subject.*low|low.*subject/.test(lowerMessage) ||
+        /subject.*below|below.*subject/.test(lowerMessage)
+      ) {
+        // FIND LOWEST ATTENDANCE SUBJECT
+        const subjects = attendance.subjects || {};
+        const subjectEntries = Object.entries(subjects);
+        
+        if (subjectEntries.length === 0) {
+          reply = addressMaybe("No subject-wise data available.", userName);
+        } else {
+          // Find subject with lowest percentage
+          let lowestSubject = null;
+          let lowestPercent = 101;
+          
+          subjectEntries.forEach(([name, data]) => {
+            const percent = data.percentage || 0;
+            if (percent < lowestPercent && data.held > 0) {
+              lowestPercent = percent;
+              lowestSubject = name;
+            }
+          });
+          
+          if (lowestSubject && lowestPercent < 75) {
+            const data = subjects[lowestSubject];
+            const needed = Math.ceil(data.held * 0.75) - data.attended;
+            reply = addressMaybe(
+              `Your lowest attendance is in ${lowestSubject} at ${lowestPercent}% (${data.attended}/${data.held}). You need to attend ${needed} more classes to reach 75%.`,
+              userName
+            );
+          } else if (lowestSubject) {
+            reply = addressMaybe(
+              `Your lowest attendance is in ${lowestSubject} at ${lowestPercent}%, which is still above 75%.`,
+              userName
+            );
+          } else {
+            reply = addressMaybe("All your subjects are above 75% attendance.", userName);
+          }
+        }
+      }
+      else {
+        // OVERALL ATTENDANCE RESPONSE
+        const parts = [
+          `Your attendance is at ${percentage}% (${attended} out of ${held} classes).`
         ];
 
         if (percentage < 75) {
-          replyLines.push("This is below the recommended threshold of 75%.");
+          parts.push("This is below the 75% threshold — something to be mindful of.");
           const needed = Math.ceil(held * 0.75) - attended;
           if (needed > 0) {
-            replyLines.push(`You need to attend ${needed} more classes to reach 75%.`);
+            parts.push(`You'd need to attend ${needed} more classes to reach 75%.`);
+          }
+          
+          // Add note about subject breakdown if available
+          if (attendance.subjects && Object.keys(attendance.subjects).length > 0) {
+            parts.push("Want to see the breakdown by subject? Just ask.");
           }
         } else if (percentage < 85) {
-          replyLines.push("This is acceptable, but could be improved for better academic standing.");
+          parts.push("It's acceptable, though there's room to improve.");
         } else {
-          replyLines.push("This is at a good level for academic requirements.");
+          parts.push("You're maintaining good attendance — that's solid.");
         }
 
-        reply = paragraph(replyLines);
+        reply = addressMaybe(parts.join(' '), userName);
       }
     }
 
-    // 🎓 ACADEMIC PERFORMANCE
+    // 🎓 ACADEMIC PERFORMANCE - FIXED WITH MORE KEYWORDS
     else if (
       lowerMessage.includes('cgpa') || 
       lowerMessage.includes('gpa') || 
@@ -236,37 +368,124 @@ router.post('/chat', async (req, res) => {
       lowerMessage.includes('sgpa') ||
       lowerMessage.includes('semester') ||
       lowerMessage.includes('marks') ||
-      lowerMessage.includes('performance')
+      lowerMessage.includes('performance') ||
+      lowerMessage.includes('result') ||
+      lowerMessage.includes('academic') ||        // ADDED
+      lowerMessage.includes('progress') ||        // ADDED
+      lowerMessage.includes('improvement') ||     // ADDED
+      lowerMessage.includes('trend')              // ADDED
     ) {
       intent = 'ACADEMIC_INSIGHTS';
       
-      if (cgpa.length > 0) {
+      if (cgpa.length === 0) {
+        reply = addressMaybe("No academic records yet. Add your semester grades and I can track your progress.", userName);
+      } 
+      
+      // =========================================
+      // SHOW ALL GRADES (SEMESTER WISE)
+      // =========================================
+      else if (
+        lowerMessage.includes('all') ||
+        lowerMessage.includes('semester wise') ||
+        lowerMessage.includes('semester-wise') ||
+        lowerMessage.includes('each semester') ||
+        lowerMessage.includes('breakdown') ||
+        lowerMessage.includes('list') ||
+        lowerMessage.includes('show my grades') ||
+        lowerMessage.includes('show grades')
+      ) {
+        const lines = [`You have ${cgpa.length} semester${cgpa.length > 1 ? 's' : ''} of data:`];
+        
+        // Show each semester with its SGPA
+        cgpa.forEach((sem, index) => {
+          const sgpa = sem.sgpa || sem.gpa || sem.score;
+          const semesterName = sem.semester || sem.name || `Semester ${index + 1}`;
+          lines.push(`  ${index + 1}. ${semesterName}: ${sgpa.toFixed(2)}`);
+        });
+        
+        // Calculate CGPA (average of all semesters)
+        if (cgpa.length > 1) {
+          const total = cgpa.reduce((sum, sem) => {
+            const sgpa = sem.sgpa || sem.gpa || sem.score;
+            return sum + sgpa;
+          }, 0);
+          const cgpaAvg = (total / cgpa.length).toFixed(2);
+          lines.push(`\nOverall CGPA: ${cgpaAvg}`);
+        }
+        
+        reply = formatReply(lines);
+      }
+      
+      // =========================================
+      // TREND ANALYSIS
+      // =========================================
+      else if (
+        lowerMessage.includes('trend') || 
+        lowerMessage.includes('progress') ||
+        lowerMessage.includes('improvement') ||
+        lowerMessage.includes('change')
+      ) {
+        if (cgpa.length > 1) {
+          const first = cgpa[0].sgpa || cgpa[0].gpa || cgpa[0].score;
+          const latest = cgpa[cgpa.length - 1];
+          const sgpa = latest.sgpa || latest.gpa || latest.score;
+          const difference = sgpa - first;
+          
+          // Show trend with emoji indicator
+          let trend = '';
+          if (difference > 0.3) trend = '📈 strong improvement';
+          else if (difference > 0) trend = '📈 slight improvement';
+          else if (difference < -0.3) trend = '📉 significant drop';
+          else if (difference < 0) trend = '📉 slight decline';
+          else trend = '➡️ stable';
+          
+          const parts = [
+            `Over ${cgpa.length} semesters, your grades have shown ${trend}.`,
+            `Started at ${first.toFixed(2)} → now at ${sgpa.toFixed(2)} (${difference > 0 ? '+' : ''}${difference.toFixed(2)}).`
+          ];
+          
+          // Show semester-by-semester progression
+          if (cgpa.length <= 4) {
+            const progression = cgpa.map((sem, i) => {
+              const val = sem.sgpa || sem.gpa || sem.score;
+              return val.toFixed(2);
+            }).join(' → ');
+            parts.push(`Semester progression: ${progression}`);
+          }
+          
+          reply = addressMaybe(parts.join(' '), userName);
+        } else {
+          reply = addressMaybe(`Your current SGPA is ${(cgpa[0].sgpa || cgpa[0].gpa || cgpa[0].score).toFixed(2)}. Add more semesters to see trends.`, userName);
+        }
+      }
+      
+      // =========================================
+      // LATEST SGPA ONLY (DEFAULT)
+      // =========================================
+      else {
         const latest = cgpa[cgpa.length - 1];
         const sgpa = latest.sgpa || latest.gpa || latest.score;
+        const semesterName = latest.semester || latest.name || `Semester ${cgpa.length}`;
         
-        if (lowerMessage.includes('trend') || lowerMessage.includes('progress')) {
-          if (cgpa.length > 1) {
-            const first = cgpa[0].sgpa || cgpa[0].gpa || cgpa[0].score;
-            const difference = sgpa - first;
-            
-            reply = paragraph([
-              addressUser(`your academic progress shows a current SGPA of ${sgpa.toFixed(2)}`, userName),
-              `starting from ${first.toFixed(2)}`,
-              difference >= 0 
-                ? `with an improvement of +${difference.toFixed(2)} over ${cgpa.length} semesters.`
-                : `with a change of ${difference.toFixed(2)} over ${cgpa.length} semesters.`
-            ]);
-          } else {
-            reply = addressUser(`your current SGPA is ${sgpa.toFixed(2)} (based on 1 semester).`, userName);
-          }
-        } else {
+        // If only one semester exists
+        if (cgpa.length === 1) {
+          reply = addressMaybe(`Your SGPA for ${semesterName} is ${sgpa.toFixed(2)}.`, userName);
+        } 
+        // Multiple semesters - show latest and offer more options
+        else {
+          // Calculate CGPA
+          const total = cgpa.reduce((sum, sem) => {
+            const val = sem.sgpa || sem.gpa || sem.score;
+            return sum + val;
+          }, 0);
+          const cgpaAvg = (total / cgpa.length).toFixed(2);
+          
           reply = paragraph([
-            addressUser(`your latest SGPA is ${sgpa.toFixed(2)}`, userName),
-            `based on ${cgpa.length} semester${cgpa.length > 1 ? 's' : ''} of data.`
+            addressMaybe(`Your latest SGPA (${semesterName}) is ${sgpa.toFixed(2)}.`, userName),
+            `Your overall CGPA across ${cgpa.length} semesters is ${cgpaAvg}.`,
+            `Want to see all semesters or grade trends? Just ask.`
           ]);
         }
-      } else {
-        reply = addressUser("No academic records available. Add semester grades to track performance.", userName);
       }
     }
 
@@ -281,7 +500,7 @@ router.post('/chat', async (req, res) => {
       intent = 'ASSIGNMENT_PLANNING';
       
       if (assignmentCount === 0) {
-        reply = addressUser("No pending assignments.", userName);
+        reply = addressMaybe("No pending assignments at the moment.", userName);
         return res.json({ intent, reply });
       }
 
@@ -296,15 +515,15 @@ router.post('/chat', async (req, res) => {
         });
         
         if (weekAssignments.length > 0) {
-          const replyLines = [addressUser("here are assignments due this week:", userName)];
+          const lines = ["Here's what's due this week:"];
           weekAssignments.forEach(date => {
             const count = assignments[date];
             const daysUntil = Math.ceil((new Date(date) - now) / (1000 * 60 * 60 * 24));
-            replyLines.push(`• ${date}: ${count} assignment${count > 1 ? 's' : ''} (${daysUntil} days)`);
+            lines.push(`• ${date}: ${count} assignment${count > 1 ? 's' : ''} (in ${daysUntil} days)`);
           });
-          reply = formatReply(replyLines);
+          reply = addressMaybe(lines.join(' '), userName);
         } else {
-          reply = addressUser("No assignments due this week.", userName);
+          reply = addressMaybe("Nothing due this week — a good time to get ahead.", userName);
         }
       }
       
@@ -313,10 +532,10 @@ router.post('/chat', async (req, res) => {
         const nextCount = assignments[nextDate];
         const daysUntil = Math.ceil((new Date(nextDate) - now) / (1000 * 60 * 60 * 24));
         
-        reply = paragraph([
-          addressUser(`your next deadline is ${nextDate}`, userName),
-          `with ${nextCount} assignment${nextCount > 1 ? 's' : ''} due in ${daysUntil} day${daysUntil !== 1 ? 's' : ''}.`
-        ]);
+        reply = addressMaybe(
+          `Your next deadline is ${nextDate} — ${nextCount} assignment${nextCount > 1 ? 's' : ''} due in ${daysUntil} days.`,
+          userName
+        );
       }
       
       else {
@@ -324,98 +543,167 @@ router.post('/chat', async (req, res) => {
         const nearestCount = assignments[nearestDate];
         const daysUntil = Math.ceil((new Date(nearestDate) - now) / (1000 * 60 * 60 * 24));
         
-        reply = paragraph([
-          addressUser(`you have ${assignmentCount} pending assignment${assignmentCount > 1 ? 's' : ''}`, userName),
-          `with the nearest due on ${nearestDate} (${daysUntil} days)`,
-          `for ${nearestCount} assignment${nearestCount > 1 ? 's' : ''}.`
-        ]);
+        reply = addressMaybe(
+          `You have ${assignmentCount} pending assignment${assignmentCount > 1 ? 's' : ''}. The nearest is on ${nearestDate} (${nearestCount} assignment${nearestCount > 1 ? 's' : ''}, ${daysUntil} days).`,
+          userName
+        );
       }
     }
 
-    // 📅 CALENDAR & EVENTS (FIXED EXAM DETECTION)
+    // 📅 CALENDAR & EVENTS - CLEAN FORMATTING
     else if (
       lowerMessage.includes('calendar') || 
       lowerMessage.includes('event') || 
       lowerMessage.includes('exam') ||
+      lowerMessage.includes('holiday') ||
       lowerMessage.includes('important date') ||
       lowerMessage.includes('meeting')
     ) {
       intent = 'CALENDAR_MANAGEMENT';
       
       if (calendarMarks.length === 0) {
-        reply = addressUser("No important dates in calendar.", userName);
+        reply = addressMaybe("Your calendar is clear — no dates marked yet.", userName);
         return res.json({ intent, reply });
       }
 
-      const sortedDates = calendarMarks.sort();
-      const now = new Date();
+      const futureDates = getFutureDates(calendarMarks);
       
-      if (lowerMessage.includes('exam')) {
-        // FIXED: Use structured category data instead of string guessing
-        const examDates = calendarMarks.filter(d => {
-          // Assuming calendarMarks is array of objects with categoryName
-          const category = d.categoryName?.toLowerCase() || d.toLowerCase();
-          return category.includes('exam') || category.includes('test');
-        });
-        
-        if (examDates.length > 0) {
-          const replyLines = [addressUser("your exam schedule:", userName)];
-          examDates.forEach((date, index) => {
-            const daysUntil = Math.ceil((new Date(date) - now) / (1000 * 60 * 60 * 24));
-            replyLines.push(`${index + 1}. ${date} (${daysUntil} days)`);
-          });
-          reply = formatReply(replyLines);
+      if (lowerMessage.includes('holiday')) {
+        const holidays = futureDates.filter(d =>
+          (d.categoryName || '').toLowerCase().includes('holiday') ||
+          (d.categoryName || '').toLowerCase().includes('break') ||
+          (d.categoryName || '').toLowerCase().includes('vacation')
+        );
+
+        if (holidays.length === 0) {
+          reply = addressMaybe("No upcoming holidays scheduled.", userName);
         } else {
-          reply = addressUser(`found ${calendarMarks.length} important dates, none specifically marked as exams.`, userName);
+          const nextHoliday = holidays[0];
+          const daysUntil = Math.ceil(
+            (new Date(nextHoliday.date) - new Date()) / (1000 * 60 * 60 * 24)
+          );
+
+          reply = addressMaybe(
+            `Your next holiday is on ${nextHoliday.date} — ${daysUntil} day${daysUntil !== 1 ? 's' : ''} to go.`,
+            userName
+          );
+        }
+      }
+      
+      else if (lowerMessage.includes('exam')) {
+        const exams = futureDates.filter(d =>
+          (d.categoryName || '').toLowerCase().includes('exam') ||
+          (d.categoryName || '').toLowerCase().includes('test')
+        );
+
+        if (exams.length === 0) {
+          reply = addressMaybe("No upcoming exams in your calendar.", userName);
+        } else {
+          const nextExam = exams[0];
+          const daysUntil = Math.ceil(
+            (new Date(nextExam.date) - new Date()) / (1000 * 60 * 60 * 24)
+          );
+
+          reply = addressMaybe(
+            `Your next exam is on ${nextExam.date} — ${daysUntil} day${daysUntil !== 1 ? 's' : ''} left.`,
+            userName
+          );
         }
       }
       
       else if (lowerMessage.includes('next') || lowerMessage.includes('upcoming')) {
-        const nextDate = sortedDates[0];
-        const daysUntil = Math.ceil((new Date(nextDate) - now) / (1000 * 60 * 60 * 24));
-        
-        reply = paragraph([
-          addressUser(`your next important date is ${nextDate}`, userName),
-          `which is ${daysUntil} day${daysUntil !== 1 ? 's' : ''} from now.`
-        ]);
+        if (futureDates.length === 0) {
+          reply = addressMaybe("No upcoming dates in your calendar.", userName);
+        } else {
+          const nextDate = futureDates[0];
+          const daysUntil = Math.ceil(
+            (new Date(nextDate.date) - new Date()) / (1000 * 60 * 60 * 24)
+          );
+          
+          reply = addressMaybe(
+            `Your next marked date is ${nextDate.date} (${nextDate.categoryName}) — in ${daysUntil} days.`,
+            userName
+          );
+        }
       }
       
       else {
-        if (calendarMarks.length <= 3) {
-          const replyLines = [addressUser("important calendar dates:", userName)];
-          calendarMarks.forEach((date, index) => {
-            const daysUntil = Math.ceil((new Date(date) - now) / (1000 * 60 * 60 * 24));
-            replyLines.push(`${index + 1}. ${date} (${daysUntil >= 0 ? daysUntil + ' days' : 'passed'})`);
-          });
-          reply = formatReply(replyLines);
+        if (futureDates.length === 0) {
+          reply = addressMaybe("No upcoming dates in your calendar.", userName);
         } else {
-          const upcoming = sortedDates.slice(0, 3);
-          const replyLines = [
-            addressUser(`you have ${calendarMarks.length} important dates. Here are the upcoming ones:`, userName)
+          // Show ALL dates with clean bullet points
+          const lines = [
+            `You have ${futureDates.length} upcoming date${futureDates.length > 1 ? 's' : ''}:`
           ];
-          upcoming.forEach((date, index) => {
-            const daysUntil = Math.ceil((new Date(date) - now) / (1000 * 60 * 60 * 24));
-            replyLines.push(`${index + 1}. ${date} (${daysUntil} days)`);
+
+          futureDates.forEach((d, i) => {
+            const daysUntil = Math.ceil(
+              (new Date(d.date) - new Date()) / (1000 * 60 * 60 * 24)
+            );
+            lines.push(`  ${i+1}. ${d.date} — ${d.categoryName} (in ${daysUntil} days)`);
           });
-          reply = formatReply(replyLines);
+
+          reply = formatReply(lines);
         }
       }
     }
 
-    // ⏰ TIMETABLE & SCHEDULE (WITH ANALYSIS)
+    // ⏰ TIMETABLE & SCHEDULE - FIXED INTENT DETECTION
     else if (
+      // Class-related queries
       lowerMessage.includes('class') || 
       lowerMessage.includes('lecture') || 
       lowerMessage.includes('timetable') ||
       lowerMessage.includes('schedule') ||
+      
+      // Day-specific queries
       lowerMessage.includes('tomorrow') ||
       lowerMessage.includes('today') ||
+      lowerMessage.includes('monday') ||
+      lowerMessage.includes('tuesday') ||
+      lowerMessage.includes('wednesday') ||
+      lowerMessage.includes('thursday') ||
+      lowerMessage.includes('friday') ||
+      lowerMessage.includes('saturday') ||
+      lowerMessage.includes('sunday') ||
+      
+      // Free day queries
       lowerMessage.includes('free day') ||
+      lowerMessage.includes('off day') ||
+      lowerMessage.includes('day off') ||
+      
+      // Week queries
       lowerMessage.includes('week') ||
+      lowerMessage.includes('weekly') ||
+      
+      // Workload queries - EXPANDED
       lowerMessage.includes('busy') ||
-      lowerMessage.includes('packed')
+      lowerMessage.includes('packed') ||
+      lowerMessage.includes('workload') ||
+      lowerMessage.includes('work load') ||
+      lowerMessage.includes('how busy') ||
+      lowerMessage.includes('how packed') ||
+      lowerMessage.includes('am i busy') ||
+      lowerMessage.includes('am i too busy') ||
+      lowerMessage.includes('am i packed') ||
+      lowerMessage.includes('is my week busy') ||
+      lowerMessage.includes('is my week packed') ||
+      lowerMessage.includes('overall load') ||
+      
+      // Busiest day queries
+      lowerMessage.includes('busiest day') ||
+      lowerMessage.includes('most busy') ||
+      lowerMessage.includes('which day is busiest') ||
+      lowerMessage.includes('what is my busiest day') ||
+      lowerMessage.includes('when am i busiest')
     ) {
       intent = 'TIMETABLE_ANALYSIS';
+      
+      // DEBUG: Log what triggered timetable
+      if (DEBUG) {
+        console.log('[Timetable] Triggered by:', lowerMessage);
+      }
+      
       const analysis = analyzeWeeklyPattern();
       const todayClasses = getClassesForDay(normalizedTodayIndex);
       const tomorrowClasses = getClassesForDay((normalizedTodayIndex + 1) % 7);
@@ -425,6 +713,7 @@ router.post('/chat', async (req, res) => {
         'friday': 4, 'saturday': 5, 'sunday': 6
       };
 
+      // Check for specific day mention
       let specificDay = null;
       for (const [day, index] of Object.entries(dayMap)) {
         if (lowerMessage.includes(day)) {
@@ -433,44 +722,124 @@ router.post('/chat', async (req, res) => {
         }
       }
       
-      if (lowerMessage.includes('tomorrow')) {
-        if (tomorrowClasses.length > 0) {
-          const classList = tomorrowClasses.map(c => c.name || c.subject || 'class').join(', ');
-          reply = paragraph([
-            addressUser(`tomorrow you have ${tomorrowClasses.length} class${tomorrowClasses.length > 1 ? 'es' : ''}`, userName),
-            `(${classList}).`
-          ]);
+      // =========================================
+      // BUSIEST DAY QUERY - MUST COME FIRST
+      // =========================================
+      if (
+        lowerMessage.includes('busiest day') || 
+        lowerMessage.includes('most busy') ||
+        lowerMessage.includes('which day is busiest') ||
+        lowerMessage.includes('what is my busiest day') ||
+        lowerMessage.includes('when am i busiest')
+      ) {
+        if (analysis.busiestDay.day !== null) {
+          const dayName = getDayName(analysis.busiestDay.day);
+          reply = addressMaybe(
+            `Your busiest day is ${dayName} with ${analysis.busiestDay.count} classes.`,
+            userName
+          );
+        } else if (analysis.totalClasses === 0) {
+          reply = addressMaybe("No classes scheduled this week.", userName);
         } else {
-          reply = addressUser("No classes scheduled for tomorrow.", userName);
+          reply = addressMaybe("Your schedule is pretty evenly spread out.", userName);
         }
       }
       
+      // =========================================
+      // WORKLOAD ANALYSIS QUERY
+      // =========================================
+      else if (
+        lowerMessage.includes('busy') || 
+        lowerMessage.includes('packed') ||
+        lowerMessage.includes('workload') ||
+        lowerMessage.includes('work load') ||
+        lowerMessage.includes('how busy') ||
+        lowerMessage.includes('how packed') ||
+        lowerMessage.includes('am i busy') ||
+        lowerMessage.includes('am i too busy') ||
+        lowerMessage.includes('am i packed') ||
+        lowerMessage.includes('is my week busy') ||
+        lowerMessage.includes('is my week packed') ||
+        lowerMessage.includes('overall load')
+      ) {
+        if (analysis.totalClasses === 0) {
+          reply = addressMaybe("No classes scheduled this week — you're completely free.", userName);
+        } else {
+          const parts = [
+            `You have ${analysis.totalClasses} classes across ${analysis.daysWithClasses} days this week.`
+          ];
+          
+          if (analysis.totalClasses >= 8) {
+            parts.push("That's quite a full week — make sure to pace yourself.");
+          } else if (analysis.totalClasses >= 5) {
+            parts.push("A moderate week — manageable with good planning.");
+          } else {
+            parts.push("A lighter week — good time to get ahead on other work.");
+          }
+          
+          if (analysis.busiestDay.day !== null) {
+            parts.push(`Your busiest day is ${getDayName(analysis.busiestDay.day)} with ${analysis.busiestDay.count} classes.`);
+          }
+          
+          reply = addressMaybe(parts.join(' '), userName);
+        }
+      }
+      
+      // =========================================
+      // TOMORROW QUERY
+      // =========================================
+      else if (lowerMessage.includes('tomorrow')) {
+        if (tomorrowClasses.length > 0) {
+          const classList = tomorrowClasses.map(c => c.name || c.subject || 'class').join(', ');
+          reply = addressMaybe(
+            `Tomorrow you have ${tomorrowClasses.length} class${tomorrowClasses.length > 1 ? 'es' : ''}: ${classList}.`,
+            userName
+          );
+        } else {
+          reply = addressMaybe("No classes tomorrow — you're free.", userName);
+        }
+      }
+      
+      // =========================================
+      // TODAY QUERY
+      // =========================================
       else if (lowerMessage.includes('today')) {
         if (todayClasses.length > 0) {
           const classList = todayClasses.map(c => c.name || c.subject || 'class').join(', ');
-          reply = paragraph([
-            addressUser(`today you have ${todayClasses.length} class${todayClasses.length > 1 ? 'es' : ''}`, userName),
-            `(${classList}).`
-          ]);
+          reply = addressMaybe(
+            `Today's schedule: ${todayClasses.length} class${todayClasses.length > 1 ? 'es' : ''} — ${classList}.`,
+            userName
+          );
         } else {
-          reply = addressUser("No classes scheduled today.", userName);
+          reply = addressMaybe("No classes today. A good day to catch up on work.", userName);
         }
       }
       
+      // =========================================
+      // SPECIFIC DAY QUERY
+      // =========================================
       else if (specificDay !== null) {
         const classes = getClassesForDay(specificDay);
         if (classes.length > 0) {
           const classList = classes.map(c => c.name || c.subject || 'class').join(', ');
-          reply = paragraph([
-            addressUser(`on ${getDayName(specificDay)} you have ${classes.length} class${classes.length > 1 ? 'es' : ''}`, userName),
-            `(${classList}).`
-          ]);
+          reply = addressMaybe(
+            `On ${getDayName(specificDay)}: ${classes.length} class${classes.length > 1 ? 'es' : ''} — ${classList}.`,
+            userName
+          );
         } else {
-          reply = addressUser(`No classes scheduled for ${getDayName(specificDay)}.`, userName);
+          reply = addressMaybe(`${getDayName(specificDay)} is free — no classes scheduled.`, userName);
         }
       }
       
-      else if (lowerMessage.includes('free') || lowerMessage.includes('which day')) {
+      // =========================================
+      // FREE DAY QUERY
+      // =========================================
+      else if (
+        lowerMessage.includes('free') || 
+        lowerMessage.includes('off day') || 
+        lowerMessage.includes('day off') ||
+        lowerMessage.includes('which day')
+      ) {
         const freeDays = [];
         for (let i = 0; i < 7; i++) {
           if (getClassesForDay(i).length === 0) {
@@ -479,77 +848,56 @@ router.post('/chat', async (req, res) => {
         }
         
         if (freeDays.length > 0) {
-          reply = addressUser(`days without classes: ${freeDays.join(', ')}.`, userName);
+          reply = addressMaybe(`You're free on: ${freeDays.join(', ')}.`, userName);
         } else {
-          reply = addressUser("Classes scheduled every day this week.", userName);
+          reply = addressMaybe("You have classes every day this week — no full free days.", userName);
         }
       }
       
-      else if (lowerMessage.includes('busiest') || lowerMessage.includes('most busy')) {
-        if (analysis.busiestDay.day !== null) {
-          const dayName = getDayName(analysis.busiestDay.day);
-          reply = paragraph([
-            addressUser(`the busiest day is ${dayName}`, userName),
-            `with ${analysis.busiestDay.count} classes.`
-          ]);
-        } else {
-          reply = addressUser("Schedule is evenly balanced across the week.", userName);
-        }
-      }
-      
+      // =========================================
+      // WEEKLY SCHEDULE (DEFAULT)
+      // =========================================
       else if (lowerMessage.includes('week') || lowerMessage.includes('weekly')) {
         if (analysis.totalClasses > 0) {
-          if (lowerMessage.includes('packed') || lowerMessage.includes('busy')) {
-            // WEEK ANALYSIS WITH JUDGEMENT
-            reply = paragraph([
-              addressUser(`your week includes ${analysis.totalClasses} classes spread across ${analysis.daysWithClasses} days.`, userName),
-              analysis.totalClasses >= 6
-                ? "It's a fairly busy week, especially toward the heavier days."
-                : "The workload looks manageable if you plan ahead.",
-              analysis.busiestDay.day !== null
-                ? `The busiest day is ${getDayName(analysis.busiestDay.day)}.`
-                : null
-            ]);
-          } else {
-            // WEEKLY SCHEDULE LISTING
-            const replyLines = [addressUser("weekly schedule:", userName)];
-            for (let i = 0; i < 7; i++) {
-              const classes = getClassesForDay(i);
-              const dayName = getDayName(i);
-              const todayMarker = i === normalizedTodayIndex ? ' (Today)' : '';
-              replyLines.push(`${dayName}${todayMarker}: ${classes.length} classes`);
-            }
-            replyLines.push(`Total: ${analysis.totalClasses} classes across ${analysis.daysWithClasses} days`);
-            reply = formatReply(replyLines);
+          const lines = ["Here's your week:"];
+          for (let i = 0; i < 7; i++) {
+            const classes = getClassesForDay(i);
+            const dayName = getDayName(i);
+            const todayMarker = i === normalizedTodayIndex ? ' (today)' : '';
+            const classCount = classes.length;
+            lines.push(`${dayName}${todayMarker}: ${classCount} class${classCount !== 1 ? 'es' : ''}`);
           }
+          reply = addressMaybe(lines.join(' '), userName);
         } else {
-          reply = addressUser("No classes scheduled this week.", userName);
+          reply = addressMaybe("No classes scheduled this week — a completely free week.", userName);
         }
       }
       
+      // =========================================
+      // FALLBACK - SHOW TODAY
+      // =========================================
       else {
         if (todayClasses.length > 0) {
           const classList = todayClasses.map(c => c.name || c.subject || 'class').join(', ');
-          reply = paragraph([
-            addressUser(`today you have ${todayClasses.length} class${todayClasses.length > 1 ? 'es' : ''}`, userName),
-            `(${classList}).`
-          ]);
+          reply = addressMaybe(
+            `Today: ${todayClasses.length} class${todayClasses.length > 1 ? 'es' : ''} — ${classList}.`,
+            userName
+          );
         } else {
-          reply = addressUser("No classes scheduled today. Ask about specific days or the weekly schedule.", userName);
+          reply = addressMaybe("No classes today. Want to know about tomorrow or the rest of the week?", userName);
         }
       }
     }
 
-    // 👋 GREETINGS (PERSONALIZED)
+    // 👋 GREETINGS
     else if (
       lowerMessage.includes('hi') || 
       lowerMessage.includes('hello') || 
       lowerMessage.includes('hey') ||
-      lowerMessage === ''
+      message.trim() === ''
     ) {
       intent = 'GREETING';
       const todayClasses = getClassesForDay(normalizedTodayIndex);
-      const tomorrowClasses = getClassesForDay((normalizedTodayIndex + 1) % 7);
       
       const timeOfDay = new Date().getHours();
       let greeting = 'Hello';
@@ -557,23 +905,24 @@ router.post('/chat', async (req, res) => {
       else if (timeOfDay < 17) greeting = 'Good afternoon';
       else greeting = 'Good evening';
       
-      reply = formatReply([
+      const parts = [
         `${greeting}, ${userName}.`,
-        "",
-        "Here's a quick overview of where things stand today:",
         todayClasses.length > 0
-          ? `• You have ${todayClasses.length} class${todayClasses.length > 1 ? 'es' : ''} today`
-          : "• You don't have any classes today",
+          ? `You have ${todayClasses.length} class${todayClasses.length > 1 ? 'es' : ''} today.`
+          : "You're free today — no classes scheduled.",
         assignmentCount > 0
-          ? `• ${assignmentCount} pending assignment${assignmentCount > 1 ? 's' : ''}`
+          ? `${assignmentCount} pending assignment${assignmentCount > 1 ? 's' : ''}.`
           : null,
         attendance.totalHeld > 0
-          ? `• Attendance is currently at ${attendance.percentage}%`
+          ? `Attendance at ${attendance.percentage}%.`
           : null,
         expenses.thisMonth > 0
-          ? `• ₹${expenses.thisMonth.toFixed(2)} spent this month`
+          ? `Spent ₹${expenses.thisMonth.toFixed(2)} this month.`
           : null,
-      ]);
+        "Let me know if you need anything specific."
+      ].filter(Boolean);
+      
+      reply = formatReply(parts);
     }
 
     // 😊 GRATITUDE
@@ -583,18 +932,17 @@ router.post('/chat', async (req, res) => {
       lowerMessage.includes('appreciate')
     ) {
       intent = 'GRATITUDE';
-      reply = addressUser("you're welcome. Let me know if you need assistance with anything else.", userName);
+      reply = addressMaybe("Happy to help. Let me know if you need anything else.", userName);
     }
 
-    // 🤖 DEFAULT GUIDANCE (CLEANER)
+    // 🤖 DEFAULT GUIDANCE
     else {
       intent = 'GUIDANCE';
       
-      reply = paragraph([
-        addressUser("I can help you analyse your schedule, assignments, attendance, expenses, and important dates.", userName),
-        "You can ask things like:",
-        "How busy is my week, am I low on attendance, or how my spending looks this month."
-      ]);
+      reply = addressMaybe(
+        "I can help you check your schedule, assignments, attendance, expenses, or calendar. Just ask — like 'how busy is my week' or 'when's my next exam'.",
+        userName
+      );
     }
 
     // Development logging
@@ -627,7 +975,7 @@ router.post('/chat', async (req, res) => {
     console.error('[Assistant] Error:', error);
     return res.status(500).json({ 
       intent: 'ERROR',
-      reply: "Unable to process your request. Please try again.",
+      reply: "Something went wrong. Could you try that again?",
       error: DEBUG ? error.message : undefined
     });
   }
