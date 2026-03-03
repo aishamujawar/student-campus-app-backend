@@ -1,13 +1,11 @@
 import express from 'express';
 import { body, validationResult } from 'express-validator';
+import { needsOpenAI, callOpenAI } from '../services/openai.service.js'; 
 
 const router = express.Router();
 const DEBUG = process.env.NODE_ENV !== 'production';
 
-/**
- * Campus Assistant - Calm academic advisor tone
- * Personal, name-aware responses with natural flow
- */
+// Campus Assistant 
 
 // Helper functions
 const DAYS = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday'];
@@ -204,6 +202,63 @@ router.post('/chat', validateChat, async (req, res) => {
     // Calculate assignment count safely (handle non-numbers)
     const assignmentCount = Object.values(assignments)
       .reduce((sum, count) => sum + (Number(count) || 0), 0);
+    
+    // =============================================
+    // 🚀 OPENAI INTEGRATION - ADDED HERE
+    // =============================================
+    // Build context for OpenAI
+    const openAIContext = {
+      attendance,
+      cgpa,
+      assignmentCount,
+      expenses
+    };
+
+    // SUPER TIGHT TRIGGER - ONLY for deep reasoning
+    if (
+      lowerMessage.includes('strategy to') ||
+      lowerMessage.includes('how can i improve') ||
+      lowerMessage.includes('what should i do to') ||
+      lowerMessage.includes('plan to') ||
+      lowerMessage.includes('advice on') ||
+      lowerMessage.includes('tips for') ||
+      lowerMessage.includes('recommend a') ||
+      lowerMessage.includes('suggest a') ||
+      lowerMessage.includes('help me prepare') ||
+      lowerMessage.includes('struggling with') ||
+      lowerMessage.includes('motivation') ||
+      lowerMessage.includes('overwhelmed') ||
+      lowerMessage.includes('study technique') ||
+      lowerMessage.includes('learning style') ||
+      lowerMessage.includes('time management') ||
+      lowerMessage.includes('feeling stressed') ||
+      lowerMessage.includes('feeling overwhelmed') ||
+      lowerMessage.includes('feeling anxious') ||
+      lowerMessage.includes('feeling demotivated')
+    ) {
+      console.log('[Assistant] Routing to OpenAI for:', sanitizedMessage.substring(0, 30));
+      
+      const aiReply = await callOpenAI(sanitizedMessage, openAIContext);
+      
+      if (aiReply) {
+        intent = 'AI_ASSISTED';
+        reply = aiReply;
+        
+        return res.status(200).json({
+          intent,
+          reply,
+          metadata: {
+            timestamp: now.toISOString(),
+            userName,
+            source: 'openai'
+          }
+        });
+      }
+      // Fall through to rule-based if OpenAI fails
+    }
+    // =============================================
+    // END OF OPENAI INTEGRATION
+    // =============================================
     
     // Normalize class times
     const normalizeClassTime = (cls) => {
